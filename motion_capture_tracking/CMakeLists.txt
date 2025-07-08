@@ -53,12 +53,27 @@ include_directories(
 add_executable(motion_capture_tracking_node
   src/motion_capture_tracking_node.cpp
 )
+add_executable(pose_motion_capture_node
+  src/pose_motion_capture_node.cpp
+)
 target_link_libraries(motion_capture_tracking_node
   librigidbodytracker
   libmotioncapture
   fmt::fmt
 )
+target_link_libraries(pose_motion_capture_node
+  librigidbodytracker
+  libmotioncapture
+  fmt::fmt
+)
+
 target_link_libraries(motion_capture_tracking_node
+  rclcpp::rclcpp
+  tf2_ros::tf2_ros
+  ${sensor_msgs_TARGETS}
+  ${motion_capture_tracking_interfaces_TARGETS}
+)
+target_link_libraries(pose_motion_capture_node
   rclcpp::rclcpp
   tf2_ros::tf2_ros
   ${sensor_msgs_TARGETS}
@@ -67,9 +82,16 @@ target_link_libraries(motion_capture_tracking_node
 target_include_directories(motion_capture_tracking_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
+target_include_directories(pose_motion_capture_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
 target_compile_features(motion_capture_tracking_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+target_compile_features(pose_motion_capture_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+
 
 install(TARGETS motion_capture_tracking_node
+  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS pose_motion_capture_node
   DESTINATION lib/${PROJECT_NAME})
 
 # The precompiled libNatNet library is only available for x64 Linux

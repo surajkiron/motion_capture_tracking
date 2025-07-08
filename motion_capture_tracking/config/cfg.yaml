@@ -1,21 +1,20 @@
 /motion_capture_tracking:
   ros__parameters:
     # one of "optitrack", "optitrack_closed_source", "vicon", "qualisys", "nokov", "vrpn", "motionanalysis"
-    type: "optitrack"
+    type: "vicon"
     # Specify the hostname or IP of the computer running the motion capture software
-    hostname: "130.149.82.37"
+    hostname: "192.168.1.2"
 
     # The information will always be broadcasted via tf2
     # Specify additional settings for the /poses topic here
     topics:
-      frame_id: "mocap"
+      frame_id: "world"
       poses:
         qos:
           mode: "none" # one of "none" or "sensor"
           deadline: 100.0 # Hz
       tf:
-        reference_frame: "mocap"
-        child_frame_fmt: "%s_mocap"
+        reference_frame: "world"
 
     # If desired, log the pointcloud to a binary log file for analysis with libRigidBodyTracker
     # Use "" to disable.
@@ -61,7 +60,7 @@
     # Define your rigid bodies to track with known initial position guess, name of the marker and name of the dynamics
     # from the above settings.
     rigid_bodies:
-      crazyflie:
+      car3:
         initial_position: [0,0,0]
         marker: "default"
         # marker: "default_single_marker"
