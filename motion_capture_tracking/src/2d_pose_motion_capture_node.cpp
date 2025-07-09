@@ -7,7 +7,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <motion_capture_tracking_interfaces/msg/named_pose_array.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose2_d.hpp>
 
 // Motion Capture
 #include <libmotioncapture/motioncapture.h>
@@ -120,7 +120,7 @@ int main(int argc, char **argv)
   msgPointCloud.is_dense = true;
 
   // Prepare publishers for poses
-  std::unordered_map<std::string, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> pose_publishers;
+  std::unordered_map<std::string, rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr> pose_publishers;
 
 
   auto dynamics_config_names = extract_names(parameter_overrides, "dynamics_configurations");
@@ -284,30 +284,36 @@ int main(int argc, char **argv)
       for (const auto& tf : transforms) {
         const std::string& name = tf.child_frame_id;
 
-        geometry_msgs::msg::PoseStamped pose_msg;
-        pose_msg.header.stamp = time;
-        pose_msg.header.frame_id = tf.header.frame_id;
+        geometry_msgs::msg::Pose2D pose_msg;
 
-        pose_msg.pose.position.x = tf.transform.translation.x;
-        pose_msg.pose.position.y = tf.transform.translation.y;
-        pose_msg.pose.position.z = tf.transform.translation.z;
-        pose_msg.pose.orientation = tf.transform.rotation;
+        // Calculate yaw from quaternion
+        float x = tf.transform.rotation.x;
+        float y = tf.transform.rotation.y;
+        float z = tf.transform.rotation.z;
+        float w = tf.transform.rotation.w;
+        float dcm10 = 2 * (x * y + w * z);
+        float dcm00 = w * w + x * x - y * y - z * z;
+        float yaw = std::atan2(dcm10, dcm00);
+
+        pose_msg.x = tf.transform.translation.x;
+        pose_msg.y = tf.transform.translation.y;
+        pose_msg.theta = yaw;
 
         auto it = pose_publishers.find(name);
         if (it != pose_publishers.end()) {
           it->second->publish(pose_msg);
         } else {
           // create publisher if needed
-          std::string topic_name = name + "/pose";
+          std::string topic_name = name + "/pose2d";
           
-          rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub;
+          rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr pub;
           if (poses_qos == "none") {
-            pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(topic_name, 1);
+            pub = node->create_publisher<geometry_msgs::msg::Pose2D>(topic_name, 1);
           } else if (poses_qos == "sensor") {
             rclcpp::SensorDataQoS sensor_data_qos;
             sensor_data_qos.keep_last(1);
             sensor_data_qos.deadline(rclcpp::Duration(0/*s*/, static_cast<int>(1e9/poses_deadline) /*ns*/));
-            pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(topic_name, sensor_data_qos);
+            pub = node->create_publisher<geometry_msgs::msg::Pose2D>(topic_name, sensor_data_qos);
           } else {
             throw std::runtime_error("Unknown QoS mode! " + poses_qos);
           }

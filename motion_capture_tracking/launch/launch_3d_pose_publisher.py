@@ -18,7 +18,7 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='motion_capture_tracking',
-            executable='pose_motion_capture_node',
+            executable='3d_pose_motion_capture_node',
             name='motion_capture_tracking',
             output='screen',
             parameters=[node_config]
