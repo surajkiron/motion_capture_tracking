@@ -7,6 +7,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <motion_capture_tracking_interfaces/msg/named_pose_array.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 // Motion Capture
 #include <libmotioncapture/motioncapture.h>
@@ -61,7 +62,7 @@ int main(int argc, char **argv)
   node->declare_parameter<double>("topics.poses.qos.deadline", 100.0);
   node->declare_parameter<std::string>("topics.tf.child_frame_id", "{}");
 
-  // node->declare_parameter<std::string>("logfilepath", "");
+  node->declare_parameter<std::string>("logfilepath", "");
 
   std::string motionCaptureType = node->get_parameter("type").as_string();
   std::string motionCaptureHostname = node->get_parameter("hostname").as_string();
@@ -69,11 +70,15 @@ int main(int argc, char **argv)
   std::string poses_qos = node->get_parameter("topics.poses.qos.mode").as_string();
   double poses_deadline = node->get_parameter("topics.poses.qos.deadline").as_double();
   std::string tf_child_frame_id = node->get_parameter("topics.tf.child_frame_id").as_string();
-  // std::string logFilePath = node->get_parameter("logfilepath").as_string();
+  std::string logFilePath = node->get_parameter("logfilepath").as_string();
 
   auto node_parameters_iface = node->get_node_parameters_interface();
   const std::map<std::string, rclcpp::ParameterValue> &parameter_overrides =
       node_parameters_iface->get_parameter_overrides();
+
+  librigidbodytracker::PointCloudLogger pointCloudLogger(logFilePath);
+  const bool logClouds = !logFilePath.empty();
+  std::cout << "logClouds=" <<logClouds << std::endl;  // 1
 
   // Make a new client
   std::map<std::string, std::string> cfg;
@@ -91,24 +96,32 @@ int main(int argc, char **argv)
 
   libmotioncapture::MotionCapture *mocap = libmotioncapture::MotionCapture::connect(motionCaptureType, cfg);
 
+  // prepare point cloud publisher
+  auto pubPointCloud = node->create_publisher<sensor_msgs::msg::PointCloud2>("pointCloud", 1);
 
-  // prepare pose array publisher
-  rclcpp::Publisher<motion_capture_tracking_interfaces::msg::NamedPoseArray>::SharedPtr pubPoses;
-  if (poses_qos == "none") {
-    pubPoses = node->create_publisher<motion_capture_tracking_interfaces::msg::NamedPoseArray>("poses", 1);
-  } else if (poses_qos == "sensor") {
-    rclcpp::SensorDataQoS sensor_data_qos;
-    sensor_data_qos.keep_last(1);
-    sensor_data_qos.deadline(rclcpp::Duration(0/*s*/, (int)1e9/poses_deadline /*ns*/));
-    pubPoses = node->create_publisher<motion_capture_tracking_interfaces::msg::NamedPoseArray>("poses", sensor_data_qos);
-  } else {
-    throw std::runtime_error("Unknown QoS mode! " + poses_qos);
-  }
+  sensor_msgs::msg::PointCloud2 msgPointCloud;
+  msgPointCloud.header.frame_id = frame_id;
+  msgPointCloud.height = 1;
 
-  motion_capture_tracking_interfaces::msg::NamedPoseArray msgPoses;
-  msgPoses.header.frame_id = frame_id;
+  sensor_msgs::msg::PointField field;
+  field.name = "x";
+  field.offset = 0;
+  field.datatype = sensor_msgs::msg::PointField::FLOAT32;
+  field.count = 1;
+  msgPointCloud.fields.push_back(field);
+  field.name = "y";
+  field.offset = 4;
+  msgPointCloud.fields.push_back(field);
+  field.name = "z";
+  field.offset = 8;
+  msgPointCloud.fields.push_back(field);
+  msgPointCloud.point_step = 12;
+  msgPointCloud.is_bigendian = false;
+  msgPointCloud.is_dense = true;
 
-  // prepare rigid body tracker
+  // Prepare publishers for poses
+  std::unordered_map<std::string, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> pose_publishers;
+
 
   auto dynamics_config_names = extract_names(parameter_overrides, "dynamics_configurations");
   std::vector<librigidbodytracker::DynamicsConfiguration> dynamicsConfigurations(dynamics_config_names.size());
@@ -187,7 +200,20 @@ int main(int argc, char **argv)
 
     auto pointcloud = mocap->pointCloud();
 
-    
+    // publish as pointcloud
+    msgPointCloud.header.stamp = time;
+    msgPointCloud.width = pointcloud.rows();
+    msgPointCloud.data.resize(pointcloud.rows() * 3 * 4); // width * height * pointstep
+    memcpy(msgPointCloud.data.data(), pointcloud.data(), msgPointCloud.data.size());
+    msgPointCloud.row_step = msgPointCloud.data.size();
+
+    pubPointCloud->publish(msgPointCloud);
+    if (logClouds) {
+      // pointCloudLogger.log(timestamp/1000, markers);  // point cloud log format: infinite repetitions of:  timestamp (milliseconds) : uint32
+      // std::cout << "0000000000000before log" << std::endl;
+      pointCloudLogger.log(markers);
+    }
+
 
     // run tracker
     markers->clear();
@@ -249,22 +275,46 @@ int main(int argc, char **argv)
       else
       {
         std::chrono::duration<double> elapsedSeconds = chrono_now - rigidBody.lastValidTime();
-        RCLCPP_WARN(node->get_logger(), "No updated pose for %s for %f s.", rigidBody.name().c_str(), elapsedSeconds.count());
+        // RCLCPP_WARN(node->get_logger(), "No updated pose for %s for %f s.", rigidBody.name().c_str(), elapsedSeconds.count());
       }
     }
+    
+    if (!transforms.empty()) {
+      // publish poses  
+      for (const auto& tf : transforms) {
+        const std::string& name = tf.child_frame_id;
 
-    if (transforms.size() > 0) {
-      // publish poses
-      msgPoses.header.stamp = time;
-      msgPoses.poses.resize(transforms.size());
-      for (size_t i = 0; i < transforms.size(); ++i) {
-        msgPoses.poses[i].name = transforms[i].child_frame_id;
-        msgPoses.poses[i].pose.position.x = transforms[i].transform.translation.x;
-        msgPoses.poses[i].pose.position.y = transforms[i].transform.translation.y;
-        msgPoses.poses[i].pose.position.z = transforms[i].transform.translation.z;
-        msgPoses.poses[i].pose.orientation = transforms[i].transform.rotation;
+        geometry_msgs::msg::PoseStamped pose_msg;
+        pose_msg.header.stamp = time;
+        pose_msg.header.frame_id = tf.header.frame_id;
+
+        pose_msg.pose.position.x = tf.transform.translation.x;
+        pose_msg.pose.position.y = tf.transform.translation.y;
+        pose_msg.pose.position.z = tf.transform.translation.z;
+        pose_msg.pose.orientation = tf.transform.rotation;
+
+        auto it = pose_publishers.find(name);
+        if (it != pose_publishers.end()) {
+          it->second->publish(pose_msg);
+        } else {
+          // create publisher if needed
+          std::string topic_name = name + "/pose";
+          
+          rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub;
+          if (poses_qos == "none") {
+            pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(topic_name, 1);
+          } else if (poses_qos == "sensor") {
+            rclcpp::SensorDataQoS sensor_data_qos;
+            sensor_data_qos.keep_last(1);
+            sensor_data_qos.deadline(rclcpp::Duration(0/*s*/, static_cast<int>(1e9/poses_deadline) /*ns*/));
+            pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(topic_name, sensor_data_qos);
+          } else {
+            throw std::runtime_error("Unknown QoS mode! " + poses_qos);
+          }
+          RCLCPP_WARN(node->get_logger(), "Created Pose Publisher for '%s'", name.c_str());
+          pose_publishers[name] = pub;
+        }
       }
-      pubPoses->publish(msgPoses);
 
       // send TF
       
@@ -286,8 +336,14 @@ int main(int argc, char **argv)
 
       tfbroadcaster.sendTransform(transforms);
     }
-    
+    if (logClouds) {
+      pointCloudLogger.flush();
+    }
     rclcpp::spin_some(node);
+  }
+
+  if (logClouds) {
+    pointCloudLogger.flush();
   }
 
   return 0;
