@@ -8,6 +8,11 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <motion_capture_tracking_interfaces/msg/named_pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <Eigen/Geometry>
+
+// Kalman Filter for velocity estimation
+#include <mocap_kalman/KalmanFilter.h>
 
 // Motion Capture
 #include <libmotioncapture/motioncapture.h>
@@ -61,6 +66,9 @@ int main(int argc, char **argv)
   node->declare_parameter<std::string>("topics.poses.qos.mode", "none");
   node->declare_parameter<double>("topics.poses.qos.deadline", 100.0);
   node->declare_parameter<std::string>("topics.tf.child_frame_id", "{}");
+  node->declare_parameter<int>("frame_rate", 200);
+  node->declare_parameter<double>("max_accel", 10.0);
+  node->declare_parameter<bool>("use_kalman_filter", true);
 
   node->declare_parameter<std::string>("logfilepath", "");
 
@@ -70,7 +78,24 @@ int main(int argc, char **argv)
   std::string poses_qos = node->get_parameter("topics.poses.qos.mode").as_string();
   double poses_deadline = node->get_parameter("topics.poses.qos.deadline").as_double();
   std::string tf_child_frame_id = node->get_parameter("topics.tf.child_frame_id").as_string();
+  int frame_rate = node->get_parameter("frame_rate").as_int();
+  double max_accel = node->get_parameter("max_accel").as_double();
+  bool use_kalman_filter = node->get_parameter("use_kalman_filter").as_bool();
   std::string logFilePath = node->get_parameter("logfilepath").as_string();
+  
+  // Calculate time interval from frame rate (in seconds)
+  double dt_expected = 1.0 / static_cast<double>(frame_rate);
+  
+  // Setup Kalman filter noise matrices
+  mocap_kalman::KalmanFilter::Matrix12d process_noise;
+  mocap_kalman::KalmanFilter::Matrix6d measurement_noise;
+  
+  process_noise.topLeftCorner<6, 6>() = 0.5 * Eigen::Matrix<double, 6, 6>::Identity() * dt_expected * dt_expected * max_accel;
+  process_noise.bottomRightCorner<6, 6>() = Eigen::Matrix<double, 6, 6>::Identity() * dt_expected * max_accel;
+  process_noise *= process_noise; // Make it a covariance
+  
+  measurement_noise = Eigen::Matrix<double, 6, 6>::Identity() * 1e-3;
+  measurement_noise *= measurement_noise; // Make it a covariance
 
   auto node_parameters_iface = node->get_node_parameters_interface();
   const std::map<std::string, rclcpp::ParameterValue> &parameter_overrides =
@@ -121,6 +146,21 @@ int main(int argc, char **argv)
 
   // Prepare publishers for poses
   std::unordered_map<std::string, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> pose_publishers;
+  
+  // Prepare publishers for odometry
+  std::unordered_map<std::string, rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr> odom_publishers;
+  
+  // Kalman filters for velocity estimation (one per rigid body)
+  std::unordered_map<std::string, std::shared_ptr<mocap_kalman::KalmanFilter>> kalman_filters;
+  
+  // Store previous poses for simple differentiation (when Kalman filter is disabled)
+  struct PreviousPose {
+    rclcpp::Time timestamp;
+    Eigen::Vector3d position;
+    Eigen::Quaterniond orientation;
+    bool valid;
+  };
+  std::unordered_map<std::string, PreviousPose> previous_poses;
 
 
   auto dynamics_config_names = extract_names(parameter_overrides, "dynamics_configurations");
@@ -280,7 +320,7 @@ int main(int argc, char **argv)
     }
     
     if (!transforms.empty()) {
-      // publish poses  
+      // publish poses and odometry
       for (const auto& tf : transforms) {
         const std::string& name = tf.child_frame_id;
 
@@ -293,6 +333,7 @@ int main(int argc, char **argv)
         pose_msg.pose.position.z = tf.transform.translation.z;
         pose_msg.pose.orientation = tf.transform.rotation;
 
+        // Publish pose
         auto it = pose_publishers.find(name);
         if (it != pose_publishers.end()) {
           it->second->publish(pose_msg);
@@ -313,6 +354,138 @@ int main(int argc, char **argv)
           }
           RCLCPP_WARN(node->get_logger(), "Created Pose Publisher for '%s'", name.c_str());
           pose_publishers[name] = pub;
+        }
+
+        // Compute velocities and publish odometry
+        Eigen::Vector3d current_position(tf.transform.translation.x,
+                                          tf.transform.translation.y,
+                                          tf.transform.translation.z);
+        Eigen::Quaterniond current_orientation(tf.transform.rotation.w,
+                                                tf.transform.rotation.x,
+                                                tf.transform.rotation.y,
+                                                tf.transform.rotation.z);
+
+        nav_msgs::msg::Odometry odom_msg;
+        odom_msg.header.stamp = time;
+        odom_msg.header.frame_id = tf.header.frame_id;
+        odom_msg.child_frame_id = name;
+        odom_msg.pose.pose = pose_msg.pose;
+
+        if (use_kalman_filter) {
+          // Use Kalman filter for velocity estimation
+          auto kf_it = kalman_filters.find(name);
+          if (kf_it == kalman_filters.end()) {
+            // Create new Kalman filter for this rigid body
+            auto kf = std::make_shared<mocap_kalman::KalmanFilter>();
+            kf->init(process_noise, measurement_noise, frame_rate);
+            kalman_filters[name] = kf;
+            kf_it = kalman_filters.find(name);
+            RCLCPP_INFO(node->get_logger(), "Created Kalman Filter for '%s'", name.c_str());
+          }
+
+          auto& kf = kf_it->second;
+          double current_time = time.seconds();
+
+          if (!kf->isReady()) {
+            // Initialize the filter
+            kf->prepareInitialCondition(current_time, current_orientation, current_position);
+            // Velocities are zero during initialization
+            odom_msg.twist.twist.linear.x = 0.0;
+            odom_msg.twist.twist.linear.y = 0.0;
+            odom_msg.twist.twist.linear.z = 0.0;
+            odom_msg.twist.twist.angular.x = 0.0;
+            odom_msg.twist.twist.angular.y = 0.0;
+            odom_msg.twist.twist.angular.z = 0.0;
+          } else {
+            // Perform Kalman filter prediction and update
+            kf->prediction(current_time);
+            kf->update(current_orientation, current_position);
+
+            // Use filtered state for odometry
+            odom_msg.pose.pose.position.x = kf->position.x();
+            odom_msg.pose.pose.position.y = kf->position.y();
+            odom_msg.pose.pose.position.z = kf->position.z();
+            
+            odom_msg.pose.pose.orientation.w = kf->attitude.w();
+            odom_msg.pose.pose.orientation.x = kf->attitude.x();
+            odom_msg.pose.pose.orientation.y = kf->attitude.y();
+            odom_msg.pose.pose.orientation.z = kf->attitude.z();
+
+            // Get velocities from Kalman filter
+            odom_msg.twist.twist.linear.x = kf->linear_vel.x();
+            odom_msg.twist.twist.linear.y = kf->linear_vel.y();
+            odom_msg.twist.twist.linear.z = kf->linear_vel.z();
+            
+            odom_msg.twist.twist.angular.x = kf->angular_vel.x();
+            odom_msg.twist.twist.angular.y = kf->angular_vel.y();
+            odom_msg.twist.twist.angular.z = kf->angular_vel.z();
+
+            // Populate covariance matrices
+            // Pose covariance (position and orientation)
+            Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> pose_cov(odom_msg.pose.covariance.begin());
+            pose_cov.topLeftCorner<3, 3>() = kf->state_cov.block<3, 3>(3, 3);  // position cov
+            pose_cov.topRightCorner<3, 3>() = kf->state_cov.block<3, 3>(3, 0); // position-orientation cross
+            pose_cov.bottomLeftCorner<3, 3>() = kf->state_cov.block<3, 3>(0, 3); // orientation-position cross
+            pose_cov.bottomRightCorner<3, 3>() = kf->state_cov.block<3, 3>(0, 0); // orientation cov
+            
+            // Velocity covariance (linear and angular)
+            Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> vel_cov(odom_msg.twist.covariance.begin());
+            vel_cov.topLeftCorner<3, 3>() = kf->state_cov.block<3, 3>(9, 9);  // linear vel cov
+            vel_cov.topRightCorner<3, 3>() = kf->state_cov.block<3, 3>(9, 6); // linear-angular cross
+            vel_cov.bottomLeftCorner<3, 3>() = kf->state_cov.block<3, 3>(6, 9); // angular-linear cross
+            vel_cov.bottomRightCorner<3, 3>() = kf->state_cov.block<3, 3>(6, 6); // angular vel cov
+          }
+        } else {
+          // Use simple finite difference for velocity calculation
+          auto prev_it = previous_poses.find(name);
+          if (prev_it != previous_poses.end() && prev_it->second.valid) {
+            // Use fixed time interval based on frame rate
+            double dt = dt_expected;
+            
+            // Linear velocity: differentiate position
+            Eigen::Vector3d linear_vel = (current_position - prev_it->second.position) / dt;
+            odom_msg.twist.twist.linear.x = linear_vel.x();
+            odom_msg.twist.twist.linear.y = linear_vel.y();
+            odom_msg.twist.twist.linear.z = linear_vel.z();
+
+            // Angular velocity: differentiate orientation
+            Eigen::Quaterniond q_diff = current_orientation * prev_it->second.orientation.inverse();
+            q_diff.normalize();
+            
+            Eigen::AngleAxisd angle_axis(q_diff);
+            Eigen::Vector3d angular_vel = (angle_axis.angle() * angle_axis.axis()) / dt;
+            
+            odom_msg.twist.twist.angular.x = angular_vel.x();
+            odom_msg.twist.twist.angular.y = angular_vel.y();
+            odom_msg.twist.twist.angular.z = angular_vel.z();
+          }
+          
+          // Store current pose for next iteration
+          previous_poses[name] = {time, current_position, current_orientation, true};
+        }
+
+        // Publish odometry
+        auto odom_it = odom_publishers.find(name);
+        if (odom_it != odom_publishers.end()) {
+          odom_it->second->publish(odom_msg);
+        } else {
+          // Create odometry publisher if needed
+          std::string odom_topic_name = name + "/odom";
+          
+          rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
+          if (poses_qos == "none") {
+            odom_pub = node->create_publisher<nav_msgs::msg::Odometry>(odom_topic_name, 1);
+          } else if (poses_qos == "sensor") {
+            rclcpp::SensorDataQoS sensor_data_qos;
+            sensor_data_qos.keep_last(1);
+            sensor_data_qos.deadline(rclcpp::Duration(0/*s*/, static_cast<int>(1e9/poses_deadline) /*ns*/));
+            odom_pub = node->create_publisher<nav_msgs::msg::Odometry>(odom_topic_name, sensor_data_qos);
+          } else {
+            throw std::runtime_error("Unknown QoS mode! " + poses_qos);
+          }
+          RCLCPP_WARN(node->get_logger(), "Created Odometry Publisher for '%s'", name.c_str());
+          odom_publishers[name] = odom_pub;
+          odom_pub->publish(odom_msg);
         }
       }
 

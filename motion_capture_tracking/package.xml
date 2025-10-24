@@ -12,6 +12,8 @@
   <depend>rclcpp</depend>
   <depend>tf2_ros</depend>
   <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>eigen</depend>
   <depend>eigen3_cmake_module</depend>
   <depend>libpcl-all-dev</depend>

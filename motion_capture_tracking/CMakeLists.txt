@@ -12,6 +12,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(motion_capture_tracking_interfaces REQUIRED)
 
 find_package(eigen3_cmake_module REQUIRED)
@@ -50,6 +52,19 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
 )
 
+# Build Kalman filter library
+add_library(mocap_kalman
+  src/KalmanFilter.cpp
+)
+target_include_directories(mocap_kalman PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${EIGEN3_INCLUDE_DIRS}
+)
+target_link_libraries(mocap_kalman
+  rclcpp::rclcpp
+)
+
 add_executable(motion_capture_tracking_node
   src/motion_capture_tracking_node.cpp
 )
@@ -67,6 +82,7 @@ target_link_libraries(motion_capture_tracking_node
 target_link_libraries(3d_pose_motion_capture_node
   librigidbodytracker
   libmotioncapture
+  mocap_kalman
   fmt::fmt
 )
 target_link_libraries(2d_pose_motion_capture_node
@@ -85,6 +101,8 @@ target_link_libraries(3d_pose_motion_capture_node
   rclcpp::rclcpp
   tf2_ros::tf2_ros
   ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
   ${motion_capture_tracking_interfaces_TARGETS}
 )
 target_link_libraries(2d_pose_motion_capture_node
